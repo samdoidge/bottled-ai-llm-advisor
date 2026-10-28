@@ -32,6 +32,14 @@ tests/bottled_ai/        context tests, run inside a Bottled AI checkout
 main.py.patch            opt-in strategy selection
 ```
 
+## Diff against upstream
+
+The full change against `xaved88/bottled_ai` `main` is 10 files, +502/−1: nine new files under `rs/ai/llm_advisor/`, plus two lines in `main.py`.
+
+- Commit: <https://github.com/samdoidge/bottled_ai/commit/e30d70a>
+- Compare: <https://github.com/xaved88/bottled_ai/compare/main...samdoidge:llm-advisor-example>
+- Patch: [`llm-advisor.patch`](llm-advisor.patch)
+
 ## Install
 
 1. Clone [Bottled AI](https://github.com/xaved88/bottled_ai) and follow its setup (CommunicationMod, mods).

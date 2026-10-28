@@ -1,0 +1,605 @@
+From e30d70ab8ffdee9428b860cf3aeb10b882eca689 Mon Sep 17 00:00:00 2001
+From: Sam Doidge <sam@samdoidge.com>
+Date: Wed, 28 Oct 2026 17:45:07 +0800
+Subject: [PATCH] Example: minimal LLM advisor for Bottled AI
+
+---
+ main.py                                       |   3 +-
+ rs/ai/llm_advisor/__init__.py                 |   7 +
+ rs/ai/llm_advisor/client.py                   |  39 ++++
+ rs/ai/llm_advisor/config.py                   |  35 ++++
+ rs/ai/llm_advisor/context.py                  |  58 ++++++
+ rs/ai/llm_advisor/core.py                     | 194 ++++++++++++++++++
+ rs/ai/llm_advisor/handlers/__init__.py        |   1 +
+ .../handlers/card_reward_handler.py           |  78 +++++++
+ rs/ai/llm_advisor/prompts.py                  |  19 ++
+ rs/ai/llm_advisor/strategy.py                 |  69 +++++++
+ 10 files changed, 502 insertions(+), 1 deletion(-)
+ create mode 100644 rs/ai/llm_advisor/__init__.py
+ create mode 100644 rs/ai/llm_advisor/client.py
+ create mode 100644 rs/ai/llm_advisor/config.py
+ create mode 100644 rs/ai/llm_advisor/context.py
+ create mode 100644 rs/ai/llm_advisor/core.py
+ create mode 100644 rs/ai/llm_advisor/handlers/__init__.py
+ create mode 100644 rs/ai/llm_advisor/handlers/card_reward_handler.py
+ create mode 100644 rs/ai/llm_advisor/prompts.py
+ create mode 100644 rs/ai/llm_advisor/strategy.py
+
+diff --git a/main.py b/main.py
+index 8c3ae5e..aced946 100644
+--- a/main.py
++++ b/main.py
+@@ -1,6 +1,7 @@
+ import time
+ import traceback
+ 
++from rs.ai.llm_advisor.strategy import LLM_IRONCLAD
+ from rs.ai.claw_is_law.claw_is_law import CLAW_IS_LAW
+ from rs.ai.peaceful_pummeling.peaceful_pummeling import PEACEFUL_PUMMELING
+ from rs.ai.pwnder_my_orbs.pwnder_my_orbs import PWNDER_MY_ORBS
+@@ -16,7 +17,7 @@ run_seeds = [
+     #'LGZ12EEMFGUK',
+ ]
+ run_amount = 1
+-strategy = PEACEFUL_PUMMELING
++strategy = LLM_IRONCLAD
+ 
+ if __name__ == "__main__":
+     init_log()
+diff --git a/rs/ai/llm_advisor/__init__.py b/rs/ai/llm_advisor/__init__.py
+new file mode 100644
+index 0000000..cc5a9be
+--- /dev/null
++++ b/rs/ai/llm_advisor/__init__.py
+@@ -0,0 +1,7 @@
++"""
++LLM advisor for Slay the Spire / Bottled AI.
++
++Provides AI-assisted decision making that works alongside rule-based handlers.
++"""
++from rs.ai.llm_advisor.core import ask_ai, is_enabled
++from rs.ai.llm_advisor.config import ENABLED
+diff --git a/rs/ai/llm_advisor/client.py b/rs/ai/llm_advisor/client.py
+new file mode 100644
+index 0000000..2556e55
+--- /dev/null
++++ b/rs/ai/llm_advisor/client.py
+@@ -0,0 +1,39 @@
++"""Lazy OpenAI-compatible client. Disabled cleanly when unconfigured."""
++import sys
++
++from rs.ai.llm_advisor.config import API_KEY, API_BASE_URL, API_TIMEOUT
++
++_client = None
++_warned = False
++
++
++def _warn_once(message: str) -> None:
++    global _warned
++    if not _warned:
++        print(f"[llm_advisor] {message}", file=sys.stderr)
++        _warned = True
++
++
++def get_client():
++    """Return an OpenAI-compatible client, or None when unavailable."""
++    global _client
++    if _client is not None:
++        return _client
++
++    if not API_KEY:
++        _warn_once("LLM_API_KEY is not set; advisor disabled")
++        return None
++
++    try:
++        from openai import OpenAI
++    except ImportError:
++        _warn_once("openai is not installed; run 'pip install openai'")
++        return None
++
++    try:
++        _client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL, timeout=API_TIMEOUT)
++    except Exception as exc:  # pragma: no cover - depends on local environment
++        _warn_once(f"could not initialise the LLM client: {exc}")
++        return None
++
++    return _client
+diff --git a/rs/ai/llm_advisor/config.py b/rs/ai/llm_advisor/config.py
+new file mode 100644
+index 0000000..18a0a3e
+--- /dev/null
++++ b/rs/ai/llm_advisor/config.py
+@@ -0,0 +1,35 @@
++"""LLM advisor configuration. DeepSeek defaults; any OpenAI-compatible endpoint works."""
++import os
++from pathlib import Path
++
++
++def _int_env(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _float_env(name: str, default: float) -> float:
++    try:
++        return float(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++# API settings
++API_KEY = os.environ.get("LLM_API_KEY", "")
++API_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
++API_TIMEOUT = _int_env("LLM_TIMEOUT", 30)
++MAX_RETRIES = 2
++
++# Per-decision switches. Only decisions with an LLM handler can be enabled.
++ENABLED = {
++    "card_reward": True,
++}
++
++# Model settings
++MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
++MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 500)
++TEMPERATURE = _float_env("LLM_TEMPERATURE", 0.2)
++LOG_FILE = Path(__file__).parent.parent.parent.parent / "logs" / "llm_advisor.log"
+diff --git a/rs/ai/llm_advisor/context.py b/rs/ai/llm_advisor/context.py
+new file mode 100644
+index 0000000..b996885
+--- /dev/null
++++ b/rs/ai/llm_advisor/context.py
+@@ -0,0 +1,58 @@
++"""Build context dicts for AI prompts. Keep context minimal but useful."""
++from typing import List, Dict, Any
++from rs.machine.state import GameState
++
++
++def build_card_reward_context(state: GameState) -> Dict[str, Any]:
++    """Build minimal context for card reward decisions."""
++    gs = state.game_state() or {}
++    deck = state.get_deck_card_list_by_name_with_upgrade_stripped()
++
++    ctx = {
++        "deck_size": sum(deck.values()),
++        "deck": dict(deck),
++        "relics": state.get_relics()[:12],
++        "floor": state.floor(),
++    }
++
++    # Add act
++    act = gs.get("act_boss") or gs.get("act")
++    if act:
++        ctx["act"] = act
++
++    # Add HP if available
++    hp = gs.get("current_hp")
++    max_hp = gs.get("max_hp")
++    if hp and max_hp:
++        ctx["hp"] = hp
++        ctx["max_hp"] = max_hp
++        ctx["hp_pct"] = round(hp / max_hp, 2)
++
++    return ctx
++
++
++def build_boss_relic_context(state: GameState) -> Dict[str, Any]:
++    """Build context for boss relic decisions."""
++    gs = state.game_state() or {}
++    deck = state.get_deck_card_list_by_name_with_upgrade_stripped()
++
++    return {
++        "deck": dict(deck),
++        "deck_size": sum(deck.values()),
++        "relics": state.get_relics()[:12],
++        "hp": gs.get("current_hp"),
++        "max_hp": gs.get("max_hp"),
++    }
++
++
++def build_event_context(state: GameState, gold: int = None) -> Dict[str, Any]:
++    """Build context for event decisions."""
++    ctx = build_card_reward_context(state)
++    if gold is not None:
++        ctx["gold"] = gold
++    return ctx
++
++
++def build_upgrade_context(state: GameState) -> Dict[str, Any]:
++    """Build context for upgrade decisions."""
++    return build_card_reward_context(state)
+diff --git a/rs/ai/llm_advisor/core.py b/rs/ai/llm_advisor/core.py
+new file mode 100644
+index 0000000..80555e1
+--- /dev/null
++++ b/rs/ai/llm_advisor/core.py
+@@ -0,0 +1,194 @@
++"""Core AI logic: ask_ai() and response parsing."""
++import json
++import re
++import time
++import sys
++from typing import Optional, List, Dict, Any
++
++from rs.ai.llm_advisor.config import (
++    ENABLED, MAX_RETRIES, MODEL, MAX_TOKENS, TEMPERATURE, LOG_FILE, API_TIMEOUT
++)
++from rs.ai.llm_advisor.client import get_client
++from rs.ai.llm_advisor.prompts import SYSTEM_PROMPT
++
++
++def log(msg: str):
++    """Log to file and stderr."""
++    ts = time.strftime("%Y-%m-%d %H:%M:%S")
++    try:
++        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
++        with open(LOG_FILE, "a") as f:
++            f.write(f"[{ts}] {msg}\n")
++    except Exception:
++        pass
++    print(f"[LLM] {msg}", file=sys.stderr)
++
++
++def log_new_game():
++    """Log new game separator."""
++    ts = time.strftime("%Y-%m-%d %H:%M:%S")
++    separator = "\n" + "=" * 60 + "\n" + " " * 20 + "NEW GAME\n" + "=" * 60
++    try:
++        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
++        with open(LOG_FILE, "a") as f:
++            f.write(f"[{ts}] {separator}\n")
++    except Exception:
++        pass
++
++
++def is_enabled(decision_type: str) -> bool:
++    """Check if AI is enabled for this decision type."""
++    return bool(get_client()) and ENABLED.get(decision_type, False)
++
++
++def parse_response(text: str, num_choices: int, choices: List[str] = None) -> Optional[int]:
++    """Extract choice index from AI response. Returns None on failure.
++
++    If choices list is provided, also tries to match option names in text.
++    """
++    # Try JSON parsing first
++    try:
++        clean = text
++        if "```" in clean:
++            clean = clean.split("```")[1]
++            if clean.startswith("json"):
++                clean = clean[4:]
++        data = json.loads(clean)
++        idx = int(data.get("choice", -1))
++        if 0 <= idx < num_choices:
++            return idx
++    except Exception:
++        pass
++
++    # Regex fallback for "choice": N
++    m = re.search(r'"choice"\s*:\s*"?(\d+)"?', text)
++    if m:
++        idx = int(m.group(1))
++        if 0 <= idx < num_choices:
++            return idx
++
++    # Try natural language patterns (for reasoning content)
++    # Look for "option 0", "choice 1", "pick 2", "select 0", "I'll take 1"
++    patterns = [
++        r'(?:option|choice|pick|select|choose|take)\s*[:#]?\s*(\d+)',
++        r'(\d+)\s*(?:is the best|is optimal|would be best)',
++        r'(?:best|optimal|right)\s*(?:choice|option)\s*(?:is|would be)?\s*(\d+)',
++    ]
++    for pattern in patterns:
++        m = re.search(pattern, text, re.IGNORECASE)
++        if m:
++            idx = int(m.group(1))
++            if 0 <= idx < num_choices:
++                return idx
++
++    # Last resort: standalone number on a line
++    for line in text.split("\n"):
++        if line.strip().isdigit():
++            idx = int(line.strip())
++            if 0 <= idx < num_choices:
++                return idx
++
++    # If choices provided, look for option names mentioned with positive sentiment
++    # Focus on the last portion of text where conclusions usually are
++    if choices:
++        last_portion = text[-1500:] if len(text) > 1500 else text
++        for i, choice in enumerate(choices):
++            # Get the card/option name (text before parenthesis, colon, or hyphen)
++            # e.g., "Shrug It Off (1): ..." -> "Shrug It Off"
++            name_match = re.match(r'^([A-Za-z][A-Za-z\s\']+?)(?:\s*[\(:\-]|$)', choice)
++            if name_match:
++                name = name_match.group(1).strip().lower()
++                if len(name) < 3:  # Skip very short names
++                    continue
++                # Look for positive mentions like "X is good", "take X", "pick X", "choose X"
++                # Use (?:\s+\w+){0,3} to allow up to 3 words between name and sentiment
++                positive_patterns = [
++                    rf'{re.escape(name)}(?:\s+\w+){{0,3}}\s+(?:good|strong|solid|best|great|premium|excellent)',
++                    rf'(?:take|pick|choose|want|go with)\s+{re.escape(name)}',
++                    rf'{re.escape(name)}\s+(?:is the|would be|seems|provides)',
++                ]
++                for pattern in positive_patterns:
++                    if re.search(pattern, last_portion, re.IGNORECASE):
++                        return i
++
++    return None
++
++
++def ask_ai(
++    decision_type: str,
++    choices: List[str],
++    context: Dict[str, Any],
++    mode_prompt: str,
++) -> Optional[int]:
++    """Ask AI to pick from choices. Returns index or None on failure.
++
++    Args:
++        decision_type: Type of decision (card_reward, upgrade, etc.)
++        choices: List of options to choose from
++        context: Game state context dict
++        mode_prompt: Mode-specific prompt rules (combined with SYSTEM_PROMPT)
++    """
++    if not is_enabled(decision_type):
++        return None
++
++    client = get_client()
++    if not client:
++        return None
++
++    # Log new game on neow
++    if decision_type == "neow":
++        log_new_game()
++
++    # Combine system prompt with mode-specific rules
++    full_system_prompt = SYSTEM_PROMPT + "\n\n" + mode_prompt
++
++    choices_str = "\n".join(f"{i}: {c}" for i, c in enumerate(choices))
++    user_prompt = f"OPTIONS:\n{choices_str}\n\nCONTEXT:\n{json.dumps(context, separators=(',', ':'))}"
++
++    # Log request details
++    log(f"[{decision_type}] Choices: {choices}")
++    log(f"[{decision_type}] Context: {json.dumps(context, separators=(',', ':'))}")
++
++    for attempt in range(MAX_RETRIES):
++        try:
++            resp = client.chat.completions.create(
++                model=MODEL,
++                max_tokens=MAX_TOKENS,
++                temperature=TEMPERATURE,
++                timeout=API_TIMEOUT,  # Pass timeout per-request to override cached client
++                messages=[
++                    {"role": "system", "content": full_system_prompt},
++                    {"role": "user", "content": user_prompt},
++                ],
++            )
++            message = resp.choices[0].message
++
++            # Log reasoning content if present (deepseek-reasoner)
++            reasoning = getattr(message, 'reasoning_content', None)
++            if reasoning and isinstance(reasoning, str):
++                reasoning_preview = reasoning[:500] + "..." if len(reasoning) > 500 else reasoning
++                log(f"[{decision_type}] Reasoning ({len(reasoning)} chars): {reasoning_preview}")
++
++            text = (message.content or "").strip()
++            log(f"[{decision_type}] Response: {text}")
++
++            # Try parsing content first
++            idx = parse_response(text, len(choices), choices)
++            if idx is not None:
++                log(f"[{decision_type}] => Chose {idx}: {choices[idx]}")
++                return idx
++
++            # If content empty/unparseable, try extracting choice from reasoning
++            if reasoning and isinstance(reasoning, str) and not text:
++                reasoning_end = reasoning[-300:] if len(reasoning) > 300 else reasoning
++                log(f"[{decision_type}] Content empty, parsing reasoning end: ...{reasoning_end}")
++                idx = parse_response(reasoning, len(choices), choices)
++                if idx is not None:
++                    log(f"[{decision_type}] => Chose {idx} (from reasoning): {choices[idx]}")
++                    return idx
++        except Exception as e:
++            log(f"[{decision_type}] Error {attempt+1}: {e}")
++            if attempt < MAX_RETRIES - 1:
++                time.sleep(0.5)
++
++    return None
+diff --git a/rs/ai/llm_advisor/handlers/__init__.py b/rs/ai/llm_advisor/handlers/__init__.py
+new file mode 100644
+index 0000000..0e64b95
+--- /dev/null
++++ b/rs/ai/llm_advisor/handlers/__init__.py
+@@ -0,0 +1 @@
++from rs.ai.llm_advisor.handlers.card_reward_handler import CardRewardHandler
+diff --git a/rs/ai/llm_advisor/handlers/card_reward_handler.py b/rs/ai/llm_advisor/handlers/card_reward_handler.py
+new file mode 100644
+index 0000000..290e3a2
+--- /dev/null
++++ b/rs/ai/llm_advisor/handlers/card_reward_handler.py
+@@ -0,0 +1,78 @@
++"""Example LLM-powered card reward handler."""
++from typing import Optional
++
++from presentation_config import presentation_mode, p_delay
++from rs.game.screen_type import ScreenType
++from rs.machine.command import Command
++from rs.machine.handlers.handler import Handler
++from rs.machine.handlers.handler_action import HandlerAction
++from rs.machine.state import GameState
++
++from rs.ai.llm_advisor.core import ask_ai, is_enabled, log
++from rs.ai.llm_advisor.prompts import CARD_REWARD
++from rs.ai.llm_advisor.context import build_card_reward_context
++
++
++class CardRewardHandler(Handler):
++    """Card reward handler that asks the LLM for a decision."""
++
++    def can_handle(self, state: GameState) -> bool:
++        return (
++            state.has_command(Command.CHOOSE)
++            and state.screen_type() == ScreenType.CARD_REWARD.value
++            and state.game_state().get("room_phase") in ("COMPLETE", "EVENT", "COMBAT")
++        )
++
++    def handle(self, state: GameState) -> HandlerAction:
++        choice_list = state.get_choice_list()
++
++        # Try AI decision
++        ai_choice = self._ask_ai(state, choice_list)
++
++        if ai_choice is not None:
++            return self._make_action(ai_choice, choice_list, state)
++
++        # Fallback: take the first card if possible; never silently skip every reward.
++        log("[card_reward] AI unavailable, falling back to first option")
++        if choice_list:
++            return self._make_action(0, choice_list, state)
++        return self._skip_action(state)
++
++    def _ask_ai(self, state: GameState, choice_list: list) -> Optional[int]:
++        """Ask AI for card choice."""
++        if not is_enabled("card_reward"):
++            return None
++
++        choices = list(choice_list)
++        if state.has_command(Command.SKIP):
++            choices.append("SKIP (take no card)")
++        context = build_card_reward_context(state)
++
++        return ask_ai("card_reward", choices, context, CARD_REWARD)
++
++    def _make_action(self, idx: int, choice_list: list, state: GameState) -> HandlerAction:
++        """Convert choice index to HandlerAction."""
++        # If chose SKIP (last option we added)
++        if idx >= len(choice_list):
++            return self._skip_action(state)
++
++        if choice_list[idx] == "bowl":
++            cmd = "choose bowl"
++        else:
++            cmd = f"choose {idx}"
++        if presentation_mode:
++            return HandlerAction(commands=[p_delay, cmd, "wait 30"])
++        return HandlerAction(commands=[cmd, "wait 30"])
++
++    def _skip_action(self, state: GameState) -> HandlerAction:
++        """Generate skip/proceed action."""
++        room_phase = state.game_state().get("room_phase")
++
++        if room_phase == "COMBAT":
++            return HandlerAction(commands=["skip"])
++        if room_phase == "EVENT" and state.floor() != "0":
++            return HandlerAction(commands=["skip"])
++
++        if presentation_mode:
++            return HandlerAction(commands=[p_delay, "skip", "proceed"])
++        return HandlerAction(commands=["skip", "proceed"])
+diff --git a/rs/ai/llm_advisor/prompts.py b/rs/ai/llm_advisor/prompts.py
+new file mode 100644
+index 0000000..d6d67e5
+--- /dev/null
++++ b/rs/ai/llm_advisor/prompts.py
+@@ -0,0 +1,19 @@
++"""Prompts for the LLM advisor. Keep the output contract strict and small."""
++
++SYSTEM_PROMPT = """You are a decision advisor for a game-playing bot.
++You receive numbered OPTIONS and a JSON CONTEXT. Choose exactly one option.
++
++Output only a JSON object:
++{"choice": <0-based option index>, "reason": "<one short sentence>"}
++
++Do not output commands, markdown fences, or prose outside the JSON.
++If the options are close, prefer the choice that is safest and most reversible."""
++
++# Example mode prompt. Replace this with your own decision-specific rules.
++CARD_REWARD = """MODE: CARD_REWARD
++
++Choose one card reward, or SKIP when it does not improve the deck.
++Consider deck size, current HP, relics, and the deck's immediate needs.
++Skip marginal cards; avoid deck bloat.
++
++Output only the JSON object."""
+diff --git a/rs/ai/llm_advisor/strategy.py b/rs/ai/llm_advisor/strategy.py
+new file mode 100644
+index 0000000..571e0d8
+--- /dev/null
++++ b/rs/ai/llm_advisor/strategy.py
+@@ -0,0 +1,69 @@
++"""Example LLM-powered Ironclad strategy."""
++from typing import List
++
++from rs.ai._example.config import (
++    CARD_REMOVAL_PRIORITY_LIST,
++    DESIRED_CARDS_FOR_DECK,
++    HIGH_PRIORITY_UPGRADES,
++    DESIRED_CARDS_FROM_POTIONS,
++    DESIRED_POTIONS,
++)
++from rs.ai._example.handlers.event_handler import EventHandler
++from rs.ai._example.handlers.potions_handler import (
++    PotionsBossHandler,
++    PotionsEventFightHandler,
++    PotionsEliteHandler,
++)
++from rs.ai._example.handlers.shop_purchase_handler import ShopPurchaseHandler
++from rs.ai._example.handlers.upgrade_handler import UpgradeHandler
++from rs.ai.llm_advisor.handlers import CardRewardHandler
++from rs.common.handlers.common_astrolabe_handler import CommonAstrolabeHandler
++from rs.common.handlers.common_battle_handler import CommonBattleHandler
++from rs.common.handlers.common_boss_relic_handler import CommonBossRelicHandler
++from rs.common.handlers.common_campfire_handler import CommonCampfireHandler
++from rs.common.handlers.common_chest_handler import CommonChestHandler
++from rs.common.handlers.common_combat_reward_handler import CommonCombatRewardHandler
++from rs.common.handlers.common_event_handler import CommonEventHandler
++from rs.common.handlers.common_mass_discard_handler import CommonMassDiscardHandler
++from rs.common.handlers.common_map_handler import CommonMapHandler
++from rs.common.handlers.common_neow_handler import CommonNeowHandler
++from rs.common.handlers.common_purge_handler import CommonPurgeHandler
++from rs.common.handlers.common_scry_handler import CommonScryHandler
++from rs.common.handlers.common_shop_entrance_handler import CommonShopEntranceHandler
++from rs.common.handlers.common_transform_handler import CommonTransformHandler
++from rs.machine.ai_strategy import AiStrategy
++from rs.machine.character import Character
++from rs.machine.handlers.handler import Handler
++
++llm_potion_handlers: List[Handler] = [
++    PotionsBossHandler(),
++    PotionsEventFightHandler(),
++    PotionsEliteHandler(),
++]
++
++LLM_IRONCLAD: AiStrategy = AiStrategy(
++    name='LLM_IRONCLAD',
++    character=Character.IRONCLAD,
++    handlers=llm_potion_handlers + [
++        CommonAstrolabeHandler(CARD_REMOVAL_PRIORITY_LIST),
++        CommonBattleHandler(),
++        CommonBossRelicHandler(),
++        UpgradeHandler(),
++        CommonTransformHandler(CARD_REMOVAL_PRIORITY_LIST),
++        CommonPurgeHandler(CARD_REMOVAL_PRIORITY_LIST),
++        CommonCombatRewardHandler(desired_potions=DESIRED_POTIONS),
++        CardRewardHandler(),  # LLM-powered card reward handler
++        CommonNeowHandler(),
++        EventHandler(
++            removal_priority_list=CARD_REMOVAL_PRIORITY_LIST,
++            cards_desired_for_deck=DESIRED_CARDS_FOR_DECK,
++        ),
++        CommonChestHandler(),
++        CommonMapHandler(),
++        CommonCampfireHandler(HIGH_PRIORITY_UPGRADES, CARD_REMOVAL_PRIORITY_LIST),
++        CommonShopEntranceHandler(),
++        ShopPurchaseHandler(),
++        CommonMassDiscardHandler(),
++        CommonScryHandler(),
++    ],
++)
+-- 
+2.52.0
+
